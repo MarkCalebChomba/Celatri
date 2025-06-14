@@ -1,0 +1,448 @@
+import ccxt
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+import time
+import traceback
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configuration
+API_CREDENTIALS = {
+    'api_key': '68d91b8a-2d1b-4f57-83f4-a0bd7e0dcedd',
+    'secret_key': 'B08305149BBF0FD3AAF7799EA444372A',
+    'passphrase': '#Dinywa15'
+}
+
+TRADING_CONFIG = {
+    'symbol': 'XRP/USDT:USDT',
+    'leverage': 10,
+    'timeframe': '4h',
+    'historical_limit': 20000,
+    'retrain_interval': 6000  #600 
+}
+
+RISK_CONFIG = {
+    'atr_multiplier': 3.5,       # For position sizing only
+    'sl_multiplier': 1.5,        # For stop loss
+    'tp_multiplier': 3.0,        # For take profit
+    'risk_percent': 0.01,
+    'min_confidence': 0.6,
+    'contract_size': 100
+}
+
+# Indicator calculation function
+def calculate_atr(df, period=14):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    
+    tr = pd.DataFrame({
+        'h_l': high - low,
+        'h_pc': abs(high - close.shift(1)),
+        'l_pc': abs(low - close.shift(1))
+    }).max(axis=1)
+    
+    atr = tr.rolling(period).mean()
+    return atr
+
+class MLTradingBot:
+    def __init__(self):
+        try:
+            self.exchange = ccxt.okx({
+                'apiKey': API_CREDENTIALS['api_key'],
+                'secret': API_CREDENTIALS['secret_key'],
+                'password': API_CREDENTIALS['passphrase'],
+                'enableRateLimit': True,
+                'sandboxMode': False,
+                'options': {'defaultType': 'swap'}
+            })
+            self.exchange.set_sandbox_mode(False)
+            self.symbol = TRADING_CONFIG['symbol']
+            self.leverage = TRADING_CONFIG['leverage']
+            self.timeframe = TRADING_CONFIG['timeframe']
+            self.model = RandomForestClassifier(n_estimators=200, random_state=42)
+            self.scaler = StandardScaler()
+            print(f"[INIT] Bot initialized with symbol: {self.symbol}")
+            
+            # Position tracking variables
+            self.position_entry_price = None
+            self.position_atr = None
+            self.position_direction = None
+            self.trailing_stop = None    # Stop loss level
+            self.trailing_profit = None  # Trailing take profit level
+            self.initial_profit_target = None  # The initial target profit level
+            # For tracking peaks/troughs
+            self.peak_price = None       # For long positions
+            self.trough_price = None     # For short positions
+            
+            self.total_invested = 0  # Total amount invested
+            self.running_pnl = 0    # Running profit and loss
+            self.pnl_percentage = 0  # PnL percentage
+            
+            self.FIXED_PROFIT_TARGET = 10.0  # 10% profit target
+            
+            self.waiting_for_new_cycle = False
+            self.last_trade_was_profitable = False
+            self.last_trade_direction = None
+            
+        except Exception as e:
+            print(f"[INIT ERROR] {str(e)}")
+            traceback.print_exc()
+
+    def calculate_all_indicators(self, df):
+        try:
+            df['ATR'] = calculate_atr(df)
+            return df
+        except Exception as e:
+            print(f"[INDICATOR ERROR] {str(e)}")
+            traceback.print_exc()
+            raise e
+
+    def execute_trade(self, signal, confidence, df):
+        try:
+            # Get account balance
+            balance = self.exchange.fetch_balance()['USDT']['free']
+            print(f"[BALANCE] Available balance: {balance}")
+            if balance <= 0:
+                print("[TRADE] No available balance")
+                return
+
+            atr_value = df['ATR'].iloc[-1]
+            risk_amount = balance * RISK_CONFIG['risk_percent']
+            desired_contracts = risk_amount / (atr_value * RISK_CONFIG['atr_multiplier'] * RISK_CONFIG['contract_size'])
+            print(f"[TRADE] ATR: {atr_value}, Risk Amount: {risk_amount}, Desired Contracts: {desired_contracts}")
+
+            if atr_value <= 0:
+                print("[TRADE] Invalid ATR value")
+                return
+
+            self.position_atr = atr_value
+            desired_contracts = round(desired_contracts * 100) / 100
+            
+            if desired_contracts < 0.01 or desired_contracts * atr_value * RISK_CONFIG['atr_multiplier'] * RISK_CONFIG['contract_size'] > balance:
+                print("[TRADE] Position too small or insufficient margin")
+                return
+
+            self.exchange.set_leverage(self.leverage, self.symbol)
+            positions = self.exchange.fetch_positions([self.symbol])
+            current_pos = next((p for p in positions if p['symbol'] == self.symbol and float(p['contracts']) > 0), None)
+            
+            # Handle existing positions
+            if current_pos and float(current_pos['contracts']) > 0:
+                current_side = current_pos['side']
+                new_side = 'long' if signal < 0 else 'short'  # Convert signal to side
+                if current_side != new_side:  # Only close if sides are different
+                    print(f"[TRADE] Signal changed from {current_side} to {new_side}, closing position")
+                    self.close_position()
+                    time.sleep(1)  # Small delay to ensure position is closed
+                else:
+                    print(f"[TRADE] Adding to existing {current_side} position with {desired_contracts} contracts")
+                    # Continue with trade but keep existing stops
+
+            # Place new trade or add to existing
+            if abs(desired_contracts) >= 0.01:
+                side = 'sell' if signal > 0 else 'buy'
+                pos_side = 'short' if signal > 0 else 'long'
+                
+                # Execute the order
+                self.exchange.create_order(
+                    self.symbol,
+                    'market',
+                    side,
+                    abs(desired_contracts),
+                    params={
+                        'posSide': pos_side,
+                        'tdMode': 'cross',
+                        'leverage': self.leverage
+                    }
+                )
+
+                # Get contract value
+                ticker = self.exchange.fetch_ticker(self.symbol)
+                contract_value = desired_contracts * ticker['last']
+                self.total_invested = (contract_value * self.leverage) / self.leverage  # Simplify to just contract_value
+                print(f"[TRADE] Total Invested (Actual): {self.total_invested:.4f}")
+
+                # Only set new parameters if this is a new position
+                if not self.position_direction:
+                    self.position_entry_price = df['Close'].iloc[-1]
+                    self.position_atr = atr_value
+                    self.position_direction = pos_side
+                    
+                    # Set initial stops and targets for new position
+                    self.trailing_stop = (
+                        self.position_entry_price - (RISK_CONFIG['sl_multiplier'] * atr_value)
+                        if pos_side == 'long'
+                        else self.position_entry_price + (RISK_CONFIG['sl_multiplier'] * atr_value)
+                    )
+                    
+                    profit_target = (
+                        self.position_entry_price + (RISK_CONFIG['tp_multiplier'] * atr_value)
+                        if pos_side == 'long'
+                        else self.position_entry_price - (RISK_CONFIG['tp_multiplier'] * atr_value)
+                    )
+                    self.initial_profit_target = profit_target
+                    self.trailing_profit = profit_target
+                    self.peak_price = self.position_entry_price if pos_side == 'long' else None
+                    self.trough_price = self.position_entry_price if pos_side == 'short' else None
+
+                print(f"[TRADE] {'Added to' if current_pos else 'Opened new'} {pos_side} position with {desired_contracts} contracts")
+        except Exception as e:
+            print(f"[TRADE ERROR] {str(e)}")
+            traceback.print_exc()
+
+    def check_trailing_stop_and_profit(self):
+        if not self.position_direction:
+            return
+
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            current_price = ticker['last']
+            
+            # Get position info with PnL from exchange
+            positions = self.exchange.fetch_positions([self.symbol])
+            current_pos = next((p for p in positions if p['symbol'] == self.symbol and float(p['contracts']) > 0), None)
+            
+            if current_pos:
+                # Update PnL values and position size from exchange data
+                self.running_pnl = float(current_pos['unrealizedPnl'])
+                self.pnl_percentage = float(current_pos['percentage'])
+                self.total_invested = float(current_pos['notional']) / self.leverage  # Divide by leverage for actual investment
+                print(f"[CHECK] Current Price: {current_price}, PnL: {self.running_pnl:.4f}, PnL%: {self.pnl_percentage:.2f}%, Actual Invested: {self.total_invested:.4f}")
+
+                # Check fixed profit target - only for positive PnL
+                if self.pnl_percentage >= self.FIXED_PROFIT_TARGET:  # Remove abs() to only check positive values
+                    print(f"[CHECK] Fixed profit target {self.FIXED_PROFIT_TARGET}% reached!")
+                    self.close_position()
+                    return
+
+            # --- Trailing Stop Loss Logic ---
+            if self.position_direction == 'long':
+                new_stop = current_price - (RISK_CONFIG['sl_multiplier'] * self.position_atr)
+                if new_stop > self.trailing_stop:
+                    self.trailing_stop = new_stop
+                if current_price <= self.trailing_stop:
+                    print("[CHECK] Triggering long trailing stop")
+                    self.close_position()
+                    return
+
+            elif self.position_direction == 'short':
+                new_stop = current_price + (RISK_CONFIG['sl_multiplier'] * self.position_atr)
+                if new_stop < self.trailing_stop:
+                    self.trailing_stop = new_stop
+                if current_price >= self.trailing_stop:
+                    print("[CHECK] Triggering short trailing stop")
+                    self.close_position()
+                    return
+
+            # --- Trailing Take Profit Logic ---
+            if self.position_direction == 'long':
+                if current_price > self.peak_price:
+                    self.peak_price = current_price
+                    if self.peak_price > self.initial_profit_target:
+                        new_profit_target = self.peak_price - (RISK_CONFIG['tp_multiplier'] * self.position_atr)
+                        if new_profit_target > self.trailing_profit:
+                            self.trailing_profit = new_profit_target
+                if self.peak_price > self.initial_profit_target and current_price <= self.trailing_profit:
+                    print("[CHECK] Triggering long trailing take profit")
+                    self.close_position()
+            
+            elif self.position_direction == 'short':
+                if current_price < self.trough_price:
+                    self.trough_price = current_price
+                    if self.trough_price < self.initial_profit_target:
+                        new_profit_target = self.trough_price + (RISK_CONFIG['tp_multiplier'] * self.position_atr)
+                        if new_profit_target < self.trailing_profit:
+                            self.trailing_profit = new_profit_target
+                if self.trough_price < self.initial_profit_target and current_price >= self.trailing_profit:
+                    print("[CHECK] Triggering short trailing take profit")
+                    self.close_position()
+                    
+        except Exception as e:
+            print(f"[CHECK ERROR] {str(e)}")
+            traceback.print_exc()
+
+    def close_position(self):
+        try:
+            positions = self.exchange.fetch_positions([self.symbol])
+            current_pos = next((p for p in positions if p['symbol'] == self.symbol and float(p['contracts']) > 0), None)
+            if not current_pos:
+                print("[CLOSE] No position found to close.")
+                return
+
+            # Store trade info before closing
+            self.last_trade_was_profitable = float(current_pos['unrealizedPnl']) > 0
+            self.last_trade_direction = current_pos['side']
+            
+            side = 'sell' if current_pos['side'] == 'long' else 'buy'
+            print(f"[CLOSE] Closing position: {current_pos['side']} with side {side}")
+            self.exchange.create_order(
+                self.symbol,
+                'market',
+                side,
+                float(current_pos['contracts']),
+                params={
+                    'posSide': current_pos['side'],
+                    'reduceOnly': True
+                }
+            )
+            print(f"[CLOSE] Closed {current_pos['side']} position")
+            
+            print(f"[CLOSE] Final PnL: {self.running_pnl}, PnL Percentage: {self.pnl_percentage}%")
+            self.total_invested = 0  # Reset total invested after closing position
+            self.running_pnl = 0     # Reset running PnL
+            self.pnl_percentage = 0  # Reset PnL percentage
+            
+            # Reset all position tracking variables
+            self.position_entry_price = None
+            self.position_atr = None
+            self.position_direction = None
+            self.trailing_stop = None
+            self.trailing_profit = None
+            self.initial_profit_target = None
+            self.peak_price = None
+            self.trough_price = None
+            
+            if self.last_trade_was_profitable:
+                print("[CYCLE] Profitable trade completed, waiting for market pause")
+                self.waiting_for_new_cycle = True
+            
+        except Exception as e:
+            print(f"[CLOSE ERROR] {str(e)}")
+            traceback.print_exc()
+
+    def prepare_features(self, df):
+        try:
+            df = df.dropna()
+            features = df[['Close', 'ATR']]
+            scaled_features = self.scaler.fit_transform(features)
+            return scaled_features
+        except Exception as e:
+            print(f"[FEATURE ERROR] {str(e)}")
+            traceback.print_exc()
+            return None
+
+    def run_backtest(self, df):
+        initial_capital = 100
+        capital = initial_capital
+        trades = []
+
+        df = self.calculate_all_indicators(df)
+        df = df.dropna().reset_index(drop=True)
+        features_all = self.scaler.fit_transform(df[['Close', 'ATR']])
+        warmup = 50
+
+        for i in range(warmup, len(df) - 1):
+            train_features = features_all[:i]
+            train_labels = (df['Close'].shift(-1) > df['Close']).astype(int).iloc[:i]
+            self.model.fit(train_features, train_labels)
+            
+            feature_current = features_all[i].reshape(1, -1)
+            prediction = self.model.predict(feature_current)[0]
+            confidence = max(self.model.predict_proba(feature_current)[0])
+            
+            if confidence > RISK_CONFIG['min_confidence']:
+                # For backtesting, swap signals: buy signal becomes sell, sell becomes buy.
+                signal = -1 if prediction == 1 else 1
+                entry_price = df['Open'].iloc[i + 1]
+                exit_price = df['Close'].iloc[i + 1]
+                
+                if signal == 1:
+                    profit = (exit_price - entry_price) / entry_price * capital
+                else:
+                    profit = (entry_price - exit_price) / entry_price * capital
+
+                capital += profit
+                trades.append({
+                    'index': i,
+                    'signal': signal,
+                    'entry_price': entry_price,
+                    'exit_price': exit_price,
+                    'profit': profit,
+                    'capital': capital
+                })
+        
+        print("[BACKTEST] Backtest complete")
+        print("[BACKTEST] Initial Capital:", initial_capital)
+        print("[BACKTEST] Final Capital:", capital)
+        print("[BACKTEST] Total Return:", (capital - initial_capital) / initial_capital * 100, "%")
+        return trades
+
+    def run(self):
+        print("[RUN] Starting trading bot...")
+        last_analysis_time = 0
+        analysis_interval = 300  # Analyze market every 5 minutes
+        consecutive_no_signal = 0  # Track periods without trade signals
+        
+        while True:
+            try:
+                current_time = time.time()
+                
+                # Always check stop loss and take profit frequently
+                self.check_trailing_stop_and_profit()
+                
+                # Only perform full market analysis at specified intervals
+                if current_time - last_analysis_time >= analysis_interval:
+                    ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
+                    df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                    df = self.calculate_all_indicators(df)
+                    df = df.dropna()
+                    
+                    features = self.prepare_features(df)
+                    if features is None:
+                        continue
+
+                    labels = (df['Close'].shift(-1) > df['Close']).astype(int)
+                    labels = labels.iloc[:-1]
+                    features = features[:-1]
+
+                    if not hasattr(self.model, 'classes_'):
+                        if len(features) == len(labels):
+                            self.model.fit(features, labels)
+                        else:
+                            print(f"[TRAINING] Mismatched lengths: {len(features)} vs {len(labels)}")
+                        continue
+                    
+                    prediction = self.model.predict(features[-1:])[0]
+                    confidence = max(self.model.predict_proba(features[-1:])[0])
+                    
+                    # Track market pause
+                    if confidence <= RISK_CONFIG['min_confidence']:
+                        consecutive_no_signal += 1
+                        print("[SIGNAL] No trading signal detected, confidence too low")
+                        if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:  # No signals for 3 periods
+                            print("[CYCLE] Market pause detected, ready for new trades")
+                            self.waiting_for_new_cycle = False
+                    else:
+                        consecutive_no_signal = 0
+                        
+                    # Only trade if we're not waiting for a new cycle
+                    if not self.waiting_for_new_cycle and confidence > RISK_CONFIG['min_confidence']:
+                        signal = 1 if prediction == 1 else -1  # -1 for sell to 1 for buy signal
+                        self.execute_trade(signal, confidence, df)
+                    
+                    last_analysis_time = current_time
+                
+                if self.total_invested > 0:
+                    print(f"[STATUS] Actual Invested: {self.total_invested:.4f}, Running PnL: {self.running_pnl:.4f}, PnL Percentage: {self.pnl_percentage:.2f}%")
+                time.sleep(30)  # Check conditions every 30 seconds
+                
+            except Exception as e:
+                print(f"[RUN ERROR] {str(e)}")
+                traceback.print_exc()
+                time.sleep(60)
+
+if __name__ == "__main__":
+    try:
+        bot = MLTradingBot()
+        ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, bot.timeframe, limit=TRADING_CONFIG['historical_limit'])
+        df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        backtest_trades = bot.run_backtest(df)
+        print("[MAIN] Backtest complete, starting live trading...")
+        bot.run()
+    except Exception as e:
+        print(f"[CRITICAL ERROR] {str(e)}")
+        traceback.print_exc()
