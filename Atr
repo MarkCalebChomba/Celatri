@@ -38,7 +38,7 @@ RISK_CONFIG = {
 THIRD_PARTY_API = "https://api.binance.com/api/v3/klines"
 THIRD_PARTY_SYMBOL = "XRPUSDT"
 THIRD_PARTY_TIMEFRAME = "4h"  # Match OKX timeframe
-THIRD_PARTY_LIMIT = 1000      # Minimum 1000 rows
+THIRD_PARTY_LIMIT = 1000      # Train on exactly 1000 rows
 
 def calculate_atr(df, period=14):
     high = df['High']
@@ -82,6 +82,20 @@ def fetch_third_party_data():
         return df[['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']]
     except Exception as e:
         print(f"[THIRD PARTY ERROR] {str(e)}")
+        return None
+
+def fetch_okx_public_data(symbol, timeframe, limit):
+    """Fetch public data from OKX without authentication"""
+    try:
+        print(f"[OKX PUBLIC] Fetching {limit} rows of public data")
+        exchange = ccxt.okx()
+        exchange.load_markets()
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        print(f"[OKX PUBLIC] Retrieved {len(df)} rows")
+        return df
+    except Exception as e:
+        print(f"[OKX PUBLIC ERROR] {str(e)}")
         return None
 
 class MLTradingBot:
@@ -359,8 +373,19 @@ class MLTradingBot:
         capital = initial_capital
         trades = []
 
+        # Ensure we have at least 100 rows to work with
+        if len(df) < 100:
+            print(f"[BACKTEST ERROR] Insufficient data ({len(df)} rows). Minimum 100 rows required.")
+            return trades
+
         df = self.calculate_all_indicators(df)
         df = df.dropna().reset_index(drop=True)
+        
+        # Use exactly 1000 rows if available
+        if len(df) > 1000:
+            df = df.tail(1000).reset_index(drop=True)
+            print(f"[BACKTEST] Using last 1000 rows for backtesting")
+            
         features_all = self.scaler.fit_transform(df[['Close', 'ATR']])
         warmup = 50
 
@@ -415,53 +440,59 @@ class MLTradingBot:
                     try:
                         ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
                         df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                        print(f"[OHLCV] Retrieved {len(df)} rows from OKX")
                     except Exception as e:
-                        print(f"[OHLCV ERROR] {str(e)} - Using third-party data")
-                        third_party_df = fetch_third_party_data()
-                        if third_party_df is not None:
-                            df = third_party_df
-                        else:
+                        print(f"[OHLCV ERROR] {str(e)} - Using alternative data sources")
+                        # Try public OKX data first
+                        df = fetch_okx_public_data(self.symbol, self.timeframe, THIRD_PARTY_LIMIT)
+                        
+                        # If still no data, try Binance
+                        if df is None or len(df) < 100:
+                            print("[OHLCV] Trying Binance as fallback")
+                            df = fetch_third_party_data()
+                            
+                        # If still no data, use the last available data
+                        if df is None or len(df) < 100:
                             print("[OHLCV] Using empty DataFrame")
                             df = pd.DataFrame(columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                     
-                    df = self.calculate_all_indicators(df)
-                    df = df.dropna()
-                    
-                    if len(df) < 50:
-                        print(f"[WARNING] Insufficient data ({len(df)} rows) for analysis")
-                        time.sleep(60)
-                        continue
-                    
-                    features = self.prepare_features(df)
-                    if features is None:
-                        continue
-
-                    labels = (df['Close'].shift(-1) > df['Close']).astype(int)
-                    labels = labels.iloc[:-1]
-                    features = features[:-1]
-
-                    if not hasattr(self.model, 'classes_'):
-                        if len(features) == len(labels):
-                            self.model.fit(features, labels)
-                        else:
-                            print(f"[TRAINING] Mismatched lengths: {len(features)} vs {len(labels)}")
-                        continue
-                    
-                    prediction = self.model.predict(features[-1:])[0]
-                    confidence = max(self.model.predict_proba(features[-1:])[0])
-                    
-                    if confidence <= RISK_CONFIG['min_confidence']:
-                        consecutive_no_signal += 1
-                        print("[SIGNAL] No trading signal detected, confidence too low")
-                        if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:
-                            print("[CYCLE] Market pause detected, ready for new trades")
-                            self.waiting_for_new_cycle = False
-                    else:
-                        consecutive_no_signal = 0
+                    # Only process if we have enough data
+                    if len(df) >= 100:
+                        df = self.calculate_all_indicators(df)
+                        df = df.dropna()
                         
-                    if not self.waiting_for_new_cycle and confidence > RISK_CONFIG['min_confidence']:
-                        signal = 1 if prediction == 1 else -1
-                        self.execute_trade(signal, confidence, df)
+                        features = self.prepare_features(df)
+                        if features is not None and len(features) > 0:
+
+                            labels = (df['Close'].shift(-1) > df['Close']).astype(int)
+                            labels = labels.iloc[:-1]
+                            features = features[:-1]
+
+                            if not hasattr(self.model, 'classes_'):
+                                if len(features) == len(labels):
+                                    self.model.fit(features, labels)
+                                    print("[TRAINING] Initial model trained")
+                                else:
+                                    print(f"[TRAINING] Mismatched lengths: {len(features)} vs {len(labels)}")
+                                continue
+                            
+                            prediction = self.model.predict(features[-1:])[0]
+                            confidence = max(self.model.predict_proba(features[-1:])[0])
+                            
+                            if confidence <= RISK_CONFIG['min_confidence']:
+                                consecutive_no_signal += 1
+                                print("[SIGNAL] No trading signal detected, confidence too low")
+                                if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:
+                                    print("[CYCLE] Market pause detected, ready for new trades")
+                                    self.waiting_for_new_cycle = False
+                            else:
+                                consecutive_no_signal = 0
+                                
+                            if not self.waiting_for_new_cycle and confidence > RISK_CONFIG['min_confidence']:
+                                signal = 1 if prediction == 1 else -1
+                                self.execute_trade(signal, confidence, df)
+                    else:
+                        print(f"[WARNING] Insufficient data ({len(df)} rows) for analysis")
                     
                     last_analysis_time = current_time
                 
@@ -478,22 +509,36 @@ if __name__ == "__main__":
     try:
         bot = MLTradingBot()
         
-        # Try to get data from OKX first
-        try:
-            ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, bot.timeframe, limit=TRADING_CONFIG['historical_limit'])
-            df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-            print(f"[MAIN] Retrieved {len(df)} rows from OKX")
-        except Exception as e:
-            print(f"[MAIN ERROR] {str(e)} - Using third-party data")
-            df = fetch_third_party_data()
-            if df is None:
-                print("[MAIN] Using empty DataFrame for backtest")
-                df = pd.DataFrame(columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        # Get data from multiple sources
+        data_sources = [
+            lambda: bot.exchange.fetch_ohlcv(bot.symbol, bot.timeframe, limit=THIRD_PARTY_LIMIT),
+            lambda: fetch_okx_public_data(bot.symbol, bot.timeframe, THIRD_PARTY_LIMIT),
+            fetch_third_party_data
+        ]
         
-        # Run backtest and start trading
-        backtest_trades = bot.run_backtest(df)
-        print("[MAIN] Backtest complete, starting live trading...")
-        bot.run()
+        df = None
+        for source in data_sources:
+            try:
+                if callable(source):
+                    result = source()
+                    if result is not None and len(result) >= 100:
+                        df = result
+                        if isinstance(df, list):
+                            df = pd.DataFrame(df, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                        print(f"[MAIN] Retrieved {len(df)} rows from data source")
+                        break
+            except Exception as e:
+                print(f"[MAIN WARNING] Data source failed: {str(e)}")
+        
+        if df is None or len(df) < 100:
+            print("[MAIN ERROR] Unable to retrieve sufficient historical data")
+            print("[MAIN] Starting live trading without backtest")
+            bot.run()
+        else:
+            # Run backtest and start trading
+            backtest_trades = bot.run_backtest(df)
+            print("[MAIN] Backtest complete, starting live trading...")
+            bot.run()
     except Exception as e:
         print(f"[CRITICAL ERROR] {str(e)}")
         traceback.print_exc()
