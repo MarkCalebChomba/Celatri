@@ -9,31 +9,30 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-# Configuration
+# Configuration - SYMBOL FORMAT CORRECTED
 API_CREDENTIALS = {
-    'api_key': '04728f0e-1873-42e4-9662-0caaf9496221',
-    'secret_key': '7D1CE675E742F645708831C9A4B9F377',
+    'api_key': '68d91b8a-2d1b-4f57-83f4-a0bd7e0dcedd',
+    'secret_key': 'B08305149BBF0FD3AAF7799EA444372A',
     'passphrase': '#Dinywa15'
 }
 
 TRADING_CONFIG = {
-    'symbol': 'BTC/USDT:USDT',
+    'symbol': 'XRP-USDT-SWAP',  # CORRECTED OKX SYMBOL FORMAT
     'leverage': 10,
     'timeframe': '4h',
     'historical_limit': 20000,
-    'retrain_interval': 6000  #600 
+    'retrain_interval': 6000
 }
 
 RISK_CONFIG = {
-    'atr_multiplier': 3.5,       # For position sizing only
-    'sl_multiplier': 1.5,        # For stop loss
-    'tp_multiplier': 3.0,        # For take profit
+    'atr_multiplier': 3.5,
+    'sl_multiplier': 1.5,
+    'tp_multiplier': 3.0,
     'risk_percent': 0.01,
     'min_confidence': 0.6,
     'contract_size': 100
 }
 
-# Indicator calculation function
 def calculate_atr(df, period=14):
     high = df['High']
     low = df['Low']
@@ -71,22 +70,25 @@ class MLTradingBot:
             self.position_entry_price = None
             self.position_atr = None
             self.position_direction = None
-            self.trailing_stop = None    # Stop loss level
-            self.trailing_profit = None  # Trailing take profit level
-            self.initial_profit_target = None  # The initial target profit level
-            # For tracking peaks/troughs
-            self.peak_price = None       # For long positions
-            self.trough_price = None     # For short positions
+            self.trailing_stop = None
+            self.trailing_profit = None
+            self.initial_profit_target = None
+            self.peak_price = None
+            self.trough_price = None
             
-            self.total_invested = 0  # Total amount invested
-            self.running_pnl = 0    # Running profit and loss
-            self.pnl_percentage = 0  # PnL percentage
+            self.total_invested = 0
+            self.running_pnl = 0
+            self.pnl_percentage = 0
             
-            self.FIXED_PROFIT_TARGET = 10.0  # 10% profit target
+            self.FIXED_PROFIT_TARGET = 10.0
             
             self.waiting_for_new_cycle = False
             self.last_trade_was_profitable = False
             self.last_trade_direction = None
+            
+            # Load markets immediately after initialization
+            self.exchange.load_markets()
+            print(f"[MARKETS] Loaded {len(self.exchange.markets)} trading pairs")
             
         except Exception as e:
             print(f"[INIT ERROR] {str(e)}")
@@ -133,14 +135,13 @@ class MLTradingBot:
             # Handle existing positions
             if current_pos and float(current_pos['contracts']) > 0:
                 current_side = current_pos['side']
-                new_side = 'long' if signal < 0 else 'short'  # Convert signal to side
-                if current_side != new_side:  # Only close if sides are different
+                new_side = 'long' if signal < 0 else 'short'
+                if current_side != new_side:
                     print(f"[TRADE] Signal changed from {current_side} to {new_side}, closing position")
                     self.close_position()
-                    time.sleep(1)  # Small delay to ensure position is closed
+                    time.sleep(1)
                 else:
                     print(f"[TRADE] Adding to existing {current_side} position with {desired_contracts} contracts")
-                    # Continue with trade but keep existing stops
 
             # Place new trade or add to existing
             if abs(desired_contracts) >= 0.01:
@@ -163,7 +164,7 @@ class MLTradingBot:
                 # Get contract value
                 ticker = self.exchange.fetch_ticker(self.symbol)
                 contract_value = desired_contracts * ticker['last']
-                self.total_invested = (contract_value * self.leverage) / self.leverage  # Simplify to just contract_value
+                self.total_invested = contract_value
                 print(f"[TRADE] Total Invested (Actual): {self.total_invested:.4f}")
 
                 # Only set new parameters if this is a new position
@@ -172,7 +173,6 @@ class MLTradingBot:
                     self.position_atr = atr_value
                     self.position_direction = pos_side
                     
-                    # Set initial stops and targets for new position
                     self.trailing_stop = (
                         self.position_entry_price - (RISK_CONFIG['sl_multiplier'] * atr_value)
                         if pos_side == 'long'
@@ -202,24 +202,21 @@ class MLTradingBot:
             ticker = self.exchange.fetch_ticker(self.symbol)
             current_price = ticker['last']
             
-            # Get position info with PnL from exchange
             positions = self.exchange.fetch_positions([self.symbol])
             current_pos = next((p for p in positions if p['symbol'] == self.symbol and float(p['contracts']) > 0), None)
             
             if current_pos:
-                # Update PnL values and position size from exchange data
                 self.running_pnl = float(current_pos['unrealizedPnl'])
                 self.pnl_percentage = float(current_pos['percentage'])
-                self.total_invested = float(current_pos['notional']) / self.leverage  # Divide by leverage for actual investment
+                self.total_invested = float(current_pos['notional']) / self.leverage
                 print(f"[CHECK] Current Price: {current_price}, PnL: {self.running_pnl:.4f}, PnL%: {self.pnl_percentage:.2f}%, Actual Invested: {self.total_invested:.4f}")
 
-                # Check fixed profit target - only for positive PnL
-                if self.pnl_percentage >= self.FIXED_PROFIT_TARGET:  # Remove abs() to only check positive values
+                if self.pnl_percentage >= self.FIXED_PROFIT_TARGET:
                     print(f"[CHECK] Fixed profit target {self.FIXED_PROFIT_TARGET}% reached!")
                     self.close_position()
                     return
 
-            # --- Trailing Stop Loss Logic ---
+            # Trailing Stop Loss Logic
             if self.position_direction == 'long':
                 new_stop = current_price - (RISK_CONFIG['sl_multiplier'] * self.position_atr)
                 if new_stop > self.trailing_stop:
@@ -238,7 +235,7 @@ class MLTradingBot:
                     self.close_position()
                     return
 
-            # --- Trailing Take Profit Logic ---
+            # Trailing Take Profit Logic
             if self.position_direction == 'long':
                 if current_price > self.peak_price:
                     self.peak_price = current_price
@@ -273,7 +270,6 @@ class MLTradingBot:
                 print("[CLOSE] No position found to close.")
                 return
 
-            # Store trade info before closing
             self.last_trade_was_profitable = float(current_pos['unrealizedPnl']) > 0
             self.last_trade_direction = current_pos['side']
             
@@ -292,9 +288,9 @@ class MLTradingBot:
             print(f"[CLOSE] Closed {current_pos['side']} position")
             
             print(f"[CLOSE] Final PnL: {self.running_pnl}, PnL Percentage: {self.pnl_percentage}%")
-            self.total_invested = 0  # Reset total invested after closing position
-            self.running_pnl = 0     # Reset running PnL
-            self.pnl_percentage = 0  # Reset PnL percentage
+            self.total_invested = 0
+            self.running_pnl = 0
+            self.pnl_percentage = 0
             
             # Reset all position tracking variables
             self.position_entry_price = None
@@ -345,7 +341,6 @@ class MLTradingBot:
             confidence = max(self.model.predict_proba(feature_current)[0])
             
             if confidence > RISK_CONFIG['min_confidence']:
-                # For backtesting, swap signals: buy signal becomes sell, sell becomes buy.
                 signal = -1 if prediction == 1 else 1
                 entry_price = df['Open'].iloc[i + 1]
                 exit_price = df['Close'].iloc[i + 1]
@@ -374,18 +369,26 @@ class MLTradingBot:
     def run(self):
         print("[RUN] Starting trading bot...")
         last_analysis_time = 0
-        analysis_interval = 300  # Analyze market every 5 minutes
-        consecutive_no_signal = 0  # Track periods without trade signals
+        analysis_interval = 300
+        consecutive_no_signal = 0
         
         while True:
             try:
                 current_time = time.time()
                 
-                # Always check stop loss and take profit frequently
                 self.check_trailing_stop_and_profit()
                 
-                # Only perform full market analysis at specified intervals
                 if current_time - last_analysis_time >= analysis_interval:
+                    # Verify symbol exists before fetching OHLCV
+                    if self.symbol not in self.exchange.markets:
+                        print(f"[ERROR] Symbol {self.symbol} not found in available markets")
+                        print("Available swap symbols:")
+                        for symbol in self.exchange.markets:
+                            if 'SWAP' in symbol:
+                                print(symbol)
+                        time.sleep(60)
+                        continue
+                    
                     ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
                     df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                     df = self.calculate_all_indicators(df)
@@ -409,26 +412,24 @@ class MLTradingBot:
                     prediction = self.model.predict(features[-1:])[0]
                     confidence = max(self.model.predict_proba(features[-1:])[0])
                     
-                    # Track market pause
                     if confidence <= RISK_CONFIG['min_confidence']:
                         consecutive_no_signal += 1
                         print("[SIGNAL] No trading signal detected, confidence too low")
-                        if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:  # No signals for 3 periods
+                        if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:
                             print("[CYCLE] Market pause detected, ready for new trades")
                             self.waiting_for_new_cycle = False
                     else:
                         consecutive_no_signal = 0
                         
-                    # Only trade if we're not waiting for a new cycle
                     if not self.waiting_for_new_cycle and confidence > RISK_CONFIG['min_confidence']:
-                        signal = 1 if prediction == 1 else -1  # -1 for sell to 1 for buy signal
+                        signal = 1 if prediction == 1 else -1
                         self.execute_trade(signal, confidence, df)
                     
                     last_analysis_time = current_time
                 
                 if self.total_invested > 0:
                     print(f"[STATUS] Actual Invested: {self.total_invested:.4f}, Running PnL: {self.running_pnl:.4f}, PnL Percentage: {self.pnl_percentage:.2f}%")
-                time.sleep(30)  # Check conditions every 30 seconds
+                time.sleep(30)
                 
             except Exception as e:
                 print(f"[RUN ERROR] {str(e)}")
@@ -438,11 +439,20 @@ class MLTradingBot:
 if __name__ == "__main__":
     try:
         bot = MLTradingBot()
-        ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, bot.timeframe, limit=TRADING_CONFIG['historical_limit'])
-        df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        backtest_trades = bot.run_backtest(df)
-        print("[MAIN] Backtest complete, starting live trading...")
-        bot.run()
+        
+        # Verify symbol before backtest
+        if bot.symbol not in bot.exchange.markets:
+            print(f"[ERROR] Symbol {bot.symbol} not found in available markets")
+            print("Available swap symbols:")
+            for symbol in bot.exchange.markets:
+                if 'SWAP' in symbol:
+                    print(symbol)
+        else:
+            ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, bot.timeframe, limit=TRADING_CONFIG['historical_limit'])
+            df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            backtest_trades = bot.run_backtest(df)
+            print("[MAIN] Backtest complete, starting live trading...")
+            bot.run()
     except Exception as e:
         print(f"[CRITICAL ERROR] {str(e)}")
         traceback.print_exc()
