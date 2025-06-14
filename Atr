@@ -7,9 +7,10 @@ import time
 import traceback
 from datetime import datetime, timedelta
 import warnings
+import requests
 warnings.filterwarnings('ignore')
 
-# Configuration - SYMBOL FORMAT CORRECTED
+# Configuration
 API_CREDENTIALS = {
     'api_key': '68d91b8a-2d1b-4f57-83f4-a0bd7e0dcedd',
     'secret_key': 'B08305149BBF0FD3AAF7799EA444372A',
@@ -17,7 +18,7 @@ API_CREDENTIALS = {
 }
 
 TRADING_CONFIG = {
-    'symbol': 'XRP-USDT-SWAP',  # CORRECTED OKX SYMBOL FORMAT
+    'symbol': 'XRP-USDT-SWAP',
     'leverage': 10,
     'timeframe': '4h',
     'historical_limit': 20000,
@@ -33,6 +34,12 @@ RISK_CONFIG = {
     'contract_size': 100
 }
 
+# Third-party data source configuration
+THIRD_PARTY_API = "https://api.binance.com/api/v3/klines"
+THIRD_PARTY_SYMBOL = "XRPUSDT"
+THIRD_PARTY_TIMEFRAME = "4h"  # Match OKX timeframe
+THIRD_PARTY_LIMIT = 1000      # Minimum 1000 rows
+
 def calculate_atr(df, period=14):
     high = df['High']
     low = df['Low']
@@ -46,6 +53,36 @@ def calculate_atr(df, period=14):
     
     atr = tr.rolling(period).mean()
     return atr
+
+def fetch_third_party_data():
+    """Fetch historical data from Binance as a fallback"""
+    print(f"[THIRD PARTY] Fetching {THIRD_PARTY_LIMIT} rows from Binance")
+    try:
+        params = {
+            'symbol': THIRD_PARTY_SYMBOL,
+            'interval': THIRD_PARTY_TIMEFRAME,
+            'limit': THIRD_PARTY_LIMIT
+        }
+        response = requests.get(THIRD_PARTY_API, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Convert to DataFrame with same structure as OKX data
+        df = pd.DataFrame(data, columns=[
+            'Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume',
+            'Close_time', 'Quote_av', 'Trades', 'Tb_base_av', 'Tb_quote_av', 'Ignore'
+        ])
+        
+        # Convert types
+        df['Timestamp'] = df['Timestamp'].astype('int64')
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = df[col].astype(float)
+        
+        print(f"[THIRD PARTY] Retrieved {len(df)} rows from Binance")
+        return df[['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    except Exception as e:
+        print(f"[THIRD PARTY ERROR] {str(e)}")
+        return None
 
 class MLTradingBot:
     def __init__(self):
@@ -85,10 +122,6 @@ class MLTradingBot:
             self.waiting_for_new_cycle = False
             self.last_trade_was_profitable = False
             self.last_trade_direction = None
-            
-            # Load markets immediately after initialization
-            self.exchange.load_markets()
-            print(f"[MARKETS] Loaded {len(self.exchange.markets)} trading pairs")
             
         except Exception as e:
             print(f"[INIT ERROR] {str(e)}")
@@ -379,20 +412,25 @@ class MLTradingBot:
                 self.check_trailing_stop_and_profit()
                 
                 if current_time - last_analysis_time >= analysis_interval:
-                    # Verify symbol exists before fetching OHLCV
-                    if self.symbol not in self.exchange.markets:
-                        print(f"[ERROR] Symbol {self.symbol} not found in available markets")
-                        print("Available swap symbols:")
-                        for symbol in self.exchange.markets:
-                            if 'SWAP' in symbol:
-                                print(symbol)
-                        time.sleep(60)
-                        continue
+                    try:
+                        ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
+                        df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                    except Exception as e:
+                        print(f"[OHLCV ERROR] {str(e)} - Using third-party data")
+                        third_party_df = fetch_third_party_data()
+                        if third_party_df is not None:
+                            df = third_party_df
+                        else:
+                            print("[OHLCV] Using empty DataFrame")
+                            df = pd.DataFrame(columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                     
-                    ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
-                    df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                     df = self.calculate_all_indicators(df)
                     df = df.dropna()
+                    
+                    if len(df) < 50:
+                        print(f"[WARNING] Insufficient data ({len(df)} rows) for analysis")
+                        time.sleep(60)
+                        continue
                     
                     features = self.prepare_features(df)
                     if features is None:
@@ -440,19 +478,22 @@ if __name__ == "__main__":
     try:
         bot = MLTradingBot()
         
-        # Verify symbol before backtest
-        if bot.symbol not in bot.exchange.markets:
-            print(f"[ERROR] Symbol {bot.symbol} not found in available markets")
-            print("Available swap symbols:")
-            for symbol in bot.exchange.markets:
-                if 'SWAP' in symbol:
-                    print(symbol)
-        else:
+        # Try to get data from OKX first
+        try:
             ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, bot.timeframe, limit=TRADING_CONFIG['historical_limit'])
             df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-            backtest_trades = bot.run_backtest(df)
-            print("[MAIN] Backtest complete, starting live trading...")
-            bot.run()
+            print(f"[MAIN] Retrieved {len(df)} rows from OKX")
+        except Exception as e:
+            print(f"[MAIN ERROR] {str(e)} - Using third-party data")
+            df = fetch_third_party_data()
+            if df is None:
+                print("[MAIN] Using empty DataFrame for backtest")
+                df = pd.DataFrame(columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        
+        # Run backtest and start trading
+        backtest_trades = bot.run_backtest(df)
+        print("[MAIN] Backtest complete, starting live trading...")
+        bot.run()
     except Exception as e:
         print(f"[CRITICAL ERROR] {str(e)}")
         traceback.print_exc()
