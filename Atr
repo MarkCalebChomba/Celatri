@@ -17,7 +17,7 @@ API_CREDENTIALS = {
 }
 
 TRADING_CONFIG = {
-    'symbol': 'XRP-USDT-SWAP',
+    'symbol': 'XRP/USDT:USDT',
     'leverage': 10,
     'timeframe': '4h',
     'historical_limit': 20000,
